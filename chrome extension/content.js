@@ -4,14 +4,28 @@ let captureInterval = null;
 const canvas = document.createElement('canvas');
 const ctx = canvas.getContext('2d');
 
-chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-    if (request.action === "toggle") {
-        isCapturing = request.state;
-        if (isCapturing) startLoop();
-        else stopLoop();
-        sendResponse({status: "ok"});
+async function syncWithScript() {
+    try {
+        const response = await fetch('http://127.0.0.1:5001', { mode: 'cors' });
+        const data = await response.json();
+        
+        if (data.running && !isCapturing) {
+            isCapturing = true;
+            startLoop();
+        } else if (!data.running && isCapturing) {
+            isCapturing = false;
+            stopLoop();
+        }
+    } catch (e) {
+        if (isCapturing) {
+            isCapturing = false;
+            stopLoop();
+        }
     }
-});
+}
+
+// Automatically poll the Python server every 2 seconds to sync capture state
+setInterval(syncWithScript, 2000);
 
 function startLoop() {
     if (captureInterval) return;
