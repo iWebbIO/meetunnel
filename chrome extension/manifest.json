@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "QR Tunnel Capture",
+  "name": "MeeTunnel Capture",
   "version": "1.0",
   "permissions": ["activeTab"],
   "content_scripts": [

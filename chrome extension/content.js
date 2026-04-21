@@ -4,9 +4,21 @@ const canvas = document.createElement('canvas');
 const ctx = canvas.getContext('2d');
 
 async function captureFrame() {
-    // Find the video element (Meet uses video tags for feeds)
-    const video = document.querySelector('video');
+    // Find the largest video element (likely the main speaker or presentation)
+    const videos = Array.from(document.querySelectorAll('video'));
+    let video = null;
+    let maxArea = 0;
+
+    videos.forEach(v => {
+        const area = v.offsetWidth * v.offsetHeight;
+        if (area > maxArea) {
+            maxArea = area;
+            video = v;
+        }
+    });
+
     if (video && video.readyState === 4) {
+        // Maintain aspect ratio while drawing to 640x480
         canvas.width = 640;
         canvas.height = 480;
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
