@@ -164,6 +164,13 @@ class QRTunnelGUI:
     def run_web_server(self):
         outer_self = self
         class FrameHandler(BaseHTTPRequestHandler):
+            def do_OPTIONS(self):
+                self.send_response(200)
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.send_header('Access-Control-Allow-Methods', 'POST, OPTIONS')
+                self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+                self.end_headers()
+
             def do_POST(self):
                 content_length = int(self.headers['Content-Length'])
                 post_data = self.rfile.read(content_length)
@@ -174,6 +181,7 @@ class QRTunnelGUI:
                     with outer_self.frame_lock:
                         outer_self.web_frame = img
                     self.send_response(200)
+                    self.send_header('Access-Control-Allow-Origin', '*')
                     self.end_headers()
                 except: self.send_response(400); self.end_headers()
             def log_message(self, format, *args): return # Silent

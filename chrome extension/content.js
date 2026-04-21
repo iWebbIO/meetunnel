@@ -28,8 +28,9 @@ async function captureFrame() {
         try {
             await fetch('http://127.0.0.1:5001', {
                 method: 'POST',
-                mode: 'no-cors',
-                body: dataUrl
+                mode: 'cors',
+                body: dataUrl,
+                headers: { 'Content-Type': 'text/plain' }
             });
         } catch (e) {
             console.error("Python Receiver not reachable");
