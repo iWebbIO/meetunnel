@@ -10,6 +10,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import base64
 import math
 import struct
+import select
 
 # Requirements: pip install qrcode pyvirtualcam opencv-python mss numpy
 import qrcode
@@ -28,6 +29,8 @@ class QRTunnelGUI:
         self.root.title("MeeTunnel v1.0")
         self.root.geometry("500x650")
         self.running = False
+        self.socks5_active = False
+        self.role = tk.StringVar(value="host")
         
         # UI Setup
         self.tab_control = ttk.Notebook(root)
@@ -36,6 +39,8 @@ class QRTunnelGUI:
         
         self.tab_control.add(self.send_tab, text='Sender (Data -> QR)')
         self.tab_control.add(self.recv_tab, text='Receiver (QR -> Data)')
+        self.config_tab = ttk.Frame(self.tab_control)
+        self.tab_control.add(self.config_tab, text='Config & Guide')
         self.tab_control.pack(expand=1, fill="both")
         
         self.stats = {"sent": 0, "recv": 0, "errors": 0}
@@ -46,6 +51,7 @@ class QRTunnelGUI:
         
         self.setup_send_tab()
         self.setup_recv_tab()
+        self.setup_config_tab()
         
         # Status Bar
         self.status_frame = ttk.Frame(root)
@@ -108,6 +114,53 @@ class QRTunnelGUI:
 
         self.btn_recv = ttk.Button(self.recv_tab, text="Start Receiver", command=self.toggle_receiver)
         self.btn_recv.grid(column=0, row=3, columnspan=2, pady=20)
+
+    def setup_config_tab(self):
+        role_frame = ttk.LabelFrame(self.config_tab, text="Device Role Selection")
+        role_frame.pack(fill="x", padx=10, pady=10)
+        
+        ttk.Radiobutton(role_frame, text="Host (Final Destination/Egress)", variable=self.role, value="host").pack(anchor="w", padx=10)
+        ttk.Radiobutton(role_frame, text="Client (Origin/Proxy Source)", variable=self.role, value="client").pack(anchor="w", padx=10)
+        
+        self.btn_proxy = ttk.Button(self.config_tab, text="Start SOCKS5 Proxy (Client Only)", command=self.toggle_socks5)
+        self.btn_proxy.pack(pady=10)
+
+        guide_frame = ttk.LabelFrame(self.config_tab, text="Complete Guide")
+        guide_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        guide_text = (
+            "1. PREREQUISITES: Install UnityCapture driver to provide the virtual camera.\n\n"
+            "2. HOST SETUP:\n"
+            "   - Set Role to 'Host'.\n"
+            "   - Start Receiver to scan the Client's QR code video feed.\n"
+            "   - The Host will forward data to the local target port.\n\n"
+            "3. CLIENT SETUP:\n"
+            "   - Set Role to 'Client'.\n"
+            "   - Click 'Start SOCKS5 Proxy' (Listens on 127.0.0.1:1080).\n"
+            "   - Configure your browser/app to use SOCKS5 proxy at 127.0.0.1:1080.\n"
+            "   - Start Sender to transmit data via QR codes to the Host.\n\n"
+            "4. TUNNELING:\n"
+            "   - When you click 'Start Sender', a Handshake (SYNC) is sent immediately.\n"
+            "   - Ensure the Receiver is active before starting the Sender for best sync."
+        )
+        
+        self.guide_display = tk.Text(guide_frame, wrap="word", font=("Helvetica", 9), bg="#f0f0f0")
+        self.guide_display.insert("1.0", guide_text)
+        self.guide_display.config(state="disabled")
+        self.guide_display.pack(fill="both", expand=True, padx=5, pady=5)
+
+    def toggle_socks5(self):
+        if not self.socks5_active:
+            if self.role.get() != "client":
+                self.log("Error: SOCKS5 Proxy is only intended for Client role.")
+                return
+            self.socks5_active = True
+            self.btn_proxy.config(text="Stop SOCKS5 Proxy")
+            threading.Thread(target=self.run_socks5_logic, daemon=True).start()
+            self.log("SOCKS5 Proxy active on 127.0.0.1:1080")
+        else:
+            self.socks5_active = False
+            self.btn_proxy.config(text="Start SOCKS5 Proxy (Client Only)")
 
     def start_area_selection(self):
         # Minimize main window to see the screen clearly
@@ -216,12 +269,17 @@ class QRTunnelGUI:
         try:
             # Connect to the virtual camera filter
             with pyvirtualcam.Camera(width=640, height=480, fps=15, device="Unity Video Capture") as cam:
+                # Immediate Handshake on start
+                self.log("Starting Tunnel: Sending Handshake...")
+                hs_header = struct.pack("!2s B B I B B H", PROTOCOL_MAGIC, PROTOCOL_VERSION, TYPE_HANDSHAKE, 0, 0, 1, 7)
+                self.send_qr_frame(cam, hs_header + b"SYNC_V1")
+                
                 while self.running:
                     packet_datas = []
                     try:
                         # Increase buffer to handle standard MTU sizes
                         full_data, addr = sock.recvfrom(2048) 
-                        chunk_size = 350
+                        chunk_size = 300 # Slightly smaller for better reliability
                         total_frags = math.ceil(len(full_data) / chunk_size)
                         
                         for i in range(total_frags):
@@ -239,19 +297,50 @@ class QRTunnelGUI:
                         # Handshakes aren't counted in 'sent' stats to keep them meaningful
 
                     for p_data in packet_datas:
-                        qr = qrcode.QRCode(version=10, error_correction=qrcode.constants.ERROR_CORRECT_H, box_size=10, border=2)
-                        qr.add_data(p_data.decode('latin-1'))
-                        qr.make(fit=True)
-                        img = qr.make_image(fill_color="black", back_color="white").convert('RGB')
-                        frame = np.array(img)
-                        frame = cv2.resize(frame, (640, 480), interpolation=cv2.INTER_NEAREST)
-                        cam.send(frame)
-                        cam.sleep_until_next_frame()
+                        self.send_qr_frame(cam, p_data)
+                        
                     self.root.after(0, self.update_stats_ui)
 
         except Exception as e:
             self.log(f"Sender Error: {e}")
             self.running = False
+
+    def send_qr_frame(self, cam, p_data):
+        qr = qrcode.QRCode(version=10, error_correction=qrcode.constants.ERROR_CORRECT_H, box_size=10, border=2)
+        qr.add_data(p_data.decode('latin-1'))
+        qr.make(fit=True)
+        img = qr.make_image(fill_color="black", back_color="white").convert('RGB')
+        frame = np.array(img)
+        frame = cv2.resize(frame, (640, 480), interpolation=cv2.INTER_NEAREST)
+        cam.send(frame)
+        cam.sleep_until_next_frame()
+
+    def run_socks5_logic(self):
+        """Extremely minimal SOCKS5 to UDP forwarder for demonstration."""
+        proxy_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        proxy_sock.bind(('127.0.0.1', 1080))
+        proxy_sock.listen(5)
+        proxy_sock.settimeout(1.0)
+        
+        target_udp = ('127.0.0.1', int(self.send_port.get()))
+        udp_out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+        while self.socks5_active:
+            try:
+                conn, addr = proxy_sock.accept()
+                # Handshake: [Ver, NMethods, Methods] -> [Ver, Method]
+                data = conn.recv(262)
+                if not data or data[0] != 0x05: 
+                    conn.close()
+                    continue
+                conn.sendall(b"\x05\x00") # No authentication
+                
+                # Request: Just forward raw payload to UDP Tunnel
+                payload = conn.recv(4096)
+                udp_out.sendto(payload, target_udp)
+                conn.close()
+            except socket.timeout: continue
+            except Exception as e: self.log(f"Proxy Error: {e}")
 
     def run_receiver_logic(self):
         port = int(self.recv_port.get())
