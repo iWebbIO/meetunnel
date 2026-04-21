@@ -336,7 +336,7 @@ class QRTunnelGUI:
                             with self.unacked_lock:
                                 for pid, info in list(self.unacked_packets.items()):
                                     ts, old_ptype, old_sid, old_data = info
-                                    if now - ts > 1.5:
+                                    if now - ts > 2.0:  # Increased timeout to account for video lag
                                         self.log(f"Retransmitting Pkt {pid}...")
                                         ptype, stream_id, full_data, current_pkt_id = old_ptype, old_sid, old_data, pid
                                         self.unacked_packets[pid] = (now, ptype, stream_id, full_data) # Update timestamp
@@ -353,7 +353,7 @@ class QRTunnelGUI:
                                         raise socket.timeout 
 
                         # Smaller chunks + Lower QR Version = Larger, more readable blocks
-                        chunk_size = 180 
+                        chunk_size = 150  # Smaller chunks make QR pixels larger/easier to read
                         total_frags = math.ceil(len(full_data) / chunk_size)
 
                         for i in range(total_frags):
@@ -381,8 +381,8 @@ class QRTunnelGUI:
             self.running = False
 
     def send_qr_frame(self, cam, p_data):
-        # Using Version 7 or 8 makes the QR pixels larger and more resistant to video blur
-        qr = qrcode.QRCode(version=7, error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=12, border=2)
+        # Using Error Correct 'H' (30% recovery) is vital for video conferencing compression
+        qr = qrcode.QRCode(version=None, error_correction=qrcode.constants.ERROR_CORRECT_H, box_size=10, border=2)
         qr.add_data(p_data.decode('latin-1'))
         qr.make(fit=True)
         img = qr.make_image(fill_color="black", back_color="white").convert('RGB')
@@ -437,7 +437,7 @@ class QRTunnelGUI:
             conn.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
 
             while self.socks5_active:
-                data = conn.recv(4096)
+                data = conn.recv(1024) # Smaller reads to prevent massive burst fragmentation
                 if not data: break
                 self.outgoing_queue.put((TYPE_DATA, stream_id, data))
         except Exception as e:
@@ -458,7 +458,7 @@ class QRTunnelGUI:
             self.log(f"Host: Connected to {target_str} for Stream {stream_id}")
 
             while self.running:
-                data = remote_sock.recv(4096)
+                data = remote_sock.recv(1024)
                 if not data: break
                 self.outgoing_queue.put((TYPE_DATA, stream_id, data))
         except Exception as e:
