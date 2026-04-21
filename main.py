@@ -247,12 +247,18 @@ class QRTunnelGUI:
                     header, encoded = post_data.decode().split(",", 1)
                     nparr = np.frombuffer(base64.b64decode(encoded), np.uint8)
                     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                    with outer_self.frame_lock:
-                        outer_self.web_frame = img
-                    self.send_response(200)
-                    self.send_header('Access-Control-Allow-Origin', '*')
+                    if img is not None:
+                        with outer_self.frame_lock:
+                            outer_self.web_frame = img
+                        self.send_response(200)
+                        self.send_header('Access-Control-Allow-Origin', '*')
+                        self.end_headers()
+                    else:
+                        raise ValueError("Failed to decode image")
+                except Exception as e:
+                    outer_self.log(f"Web Server Data Error: {e}")
+                    self.send_response(400)
                     self.end_headers()
-                except: self.send_response(400); self.end_headers()
             def log_message(self, format, *args): return # Silent
         HTTPServer(('127.0.0.1', 5001), FrameHandler).serve_forever()
 
@@ -335,7 +341,7 @@ class QRTunnelGUI:
                     continue
                 conn.sendall(b"\x05\x00") # No authentication
                 
-                # Request: Just forward raw payload to UDP Tunnel
+                # Note: Real SOCKS5 requires handling the CONNECT request here.
                 payload = conn.recv(4096)
                 udp_out.sendto(payload, target_udp)
                 conn.close()
@@ -373,12 +379,15 @@ class QRTunnelGUI:
                 
                 # Detect and decode
                 data, bbox, _ = detector.detectAndDecode(frame)
-                if bbox is not None and not data:
-                    pass # Detected QR but couldn't decode - very common in low-res video
 
                 if data:
                     try:
-                        raw_payload = data.encode('latin-1')
+                        # Use latin-1 to preserve raw bytes from the sender
+                        try:
+                            raw_payload = data.encode('latin-1')
+                        except UnicodeEncodeError:
+                            continue # Skip malformed decodes
+
                         if len(raw_payload) >= 12:
                             magic, ver, ptype, pkt_id, f_idx, f_total, plen = struct.unpack("!2s B B I B B H", raw_payload[:12])
                             
