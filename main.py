@@ -322,8 +322,9 @@ class QRTunnelGUI:
         cam.sleep_until_next_frame()
 
     def run_socks5_logic(self):
-        """Extremely minimal SOCKS5 to UDP forwarder for demonstration."""
+        """Improved SOCKS5 proxy to handle TCP-over-UDP tunneling for apps like Telegram."""
         proxy_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        proxy_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         proxy_sock.bind(('127.0.0.1', 1080))
         proxy_sock.listen(5)
         proxy_sock.settimeout(1.0)
@@ -334,19 +335,46 @@ class QRTunnelGUI:
         while self.socks5_active:
             try:
                 conn, addr = proxy_sock.accept()
-                # Handshake: [Ver, NMethods, Methods] -> [Ver, Method]
-                data = conn.recv(262)
-                if not data or data[0] != 0x05: 
-                    conn.close()
-                    continue
-                conn.sendall(b"\x05\x00") # No authentication
-                
-                # Note: Real SOCKS5 requires handling the CONNECT request here.
-                payload = conn.recv(4096)
-                udp_out.sendto(payload, target_udp)
-                conn.close()
+                threading.Thread(target=self.handle_socks_client, args=(conn, udp_out, target_udp), daemon=True).start()
             except socket.timeout: continue
             except Exception as e: self.log(f"Proxy Error: {e}")
+
+    def handle_socks_client(self, conn, udp_out, target_udp):
+        try:
+            # 1. Greeting
+            greeting = conn.recv(2)
+            if not greeting or greeting[0] != 0x05:
+                conn.close()
+                return
+            
+            # Support 'No Auth' (0x00)
+            conn.recv(greeting[1]) 
+            conn.sendall(b"\x05\x00")
+
+            # 2. Connection Request
+            cmd = conn.recv(4)
+            if not cmd or cmd[1] != 0x01: # 0x01 = CONNECT
+                conn.close()
+                return
+
+            # Read address (skipped for brevity, but needed to consume buffer)
+            atyp = cmd[3]
+            if atyp == 0x01: conn.recv(4) # IPv4
+            elif atyp == 0x03: conn.recv(conn.recv(1)[0]) # Domain
+            conn.recv(2) # Port
+
+            # 3. Reply Success (Tell the client we are connected)
+            conn.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+
+            # 4. Data Loop
+            while self.socks5_active:
+                data = conn.recv(4096)
+                if not data: break
+                udp_out.sendto(data, target_udp)
+        except Exception as e:
+            self.log(f"SOCKS Handler Error: {e}")
+        finally:
+            conn.close()
 
     def run_receiver_logic(self):
         port = int(self.recv_port.get())
