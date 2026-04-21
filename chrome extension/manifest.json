@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "QR Tunnel Capture",
+  "version": "1.0",
+  "permissions": ["activeTab"],
+  "content_scripts": [
+    {
+      "matches": ["https://meet.google.com/*", "http://localhost/*"],
+      "js": ["content.js"]
+    }
+  ],
+  "host_permissions": ["http://127.0.0.1:5001/"]
+}
