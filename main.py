@@ -314,9 +314,10 @@ class QRTunnelGUI:
                             try:
                                 full_data, addr = sock.recvfrom(2048)
                             except socket.timeout:
-                                raise socket.timeout # Re-raise to trigger handshake logic
+                                raise socket.timeout 
 
-                        chunk_size = 300 # Slightly smaller for better reliability
+                        # Smaller chunks + Lower QR Version = Larger, more readable blocks
+                        chunk_size = 180 
                         total_frags = math.ceil(len(full_data) / chunk_size)
                         
                         for i in range(total_frags):
@@ -345,14 +346,15 @@ class QRTunnelGUI:
             self.running = False
 
     def send_qr_frame(self, cam, p_data):
-        qr = qrcode.QRCode(version=10, error_correction=qrcode.constants.ERROR_CORRECT_H, box_size=10, border=2)
+        # Using Version 7 or 8 makes the QR pixels larger and more resistant to video blur
+        qr = qrcode.QRCode(version=7, error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=12, border=2)
         qr.add_data(p_data.decode('latin-1'))
         qr.make(fit=True)
         img = qr.make_image(fill_color="black", back_color="white").convert('RGB')
         frame = np.array(img)
         frame = cv2.resize(frame, (640, 480), interpolation=cv2.INTER_NEAREST)
         cam.send(frame)
-        cam.sleep_until_next_frame()
+        time.sleep(0.06) # Explicitly cap at ~15fps to allow receiver processing time
 
     def run_socks5_logic(self):
         """Improved SOCKS5 proxy to handle TCP-over-UDP tunneling for apps like Telegram."""
