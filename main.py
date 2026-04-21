@@ -52,6 +52,7 @@ class QRTunnelGUI:
         self.active_streams = {}    # {stream_id: socket}
         self.outgoing_queue = queue.Queue()
         self.unacked_packets = {}   # {pkt_id: (timestamp, ptype, stream_id, data)}
+        self.web_server_started = False
         self.unacked_lock = threading.Lock()
         self.frame_lock = threading.Lock()
         self.web_frame = None
@@ -256,6 +257,8 @@ class QRTunnelGUI:
             self.btn_recv.config(text="Start Receiver")
 
     def run_web_server(self):
+        if self.web_server_started: return
+        self.web_server_started = True
         outer_self = self
         class FrameHandler(BaseHTTPRequestHandler):
             def do_GET(self):
@@ -301,16 +304,17 @@ class QRTunnelGUI:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.bind((ip, port))
         sock.settimeout(0.5)
+        with self.unacked_lock: self.unacked_packets.clear()
         
         seq = 0
         self.log(f"Sender active on {ip}:{port}")
         
         try:
             # Connect to the virtual camera filter
-            with pyvirtualcam.Camera(width=640, height=480, fps=15, device="Unity Video Capture") as cam:
+            with pyvirtualcam.Camera(width=640, height=480, fps=20, device="Unity Video Capture") as cam:
                 # Immediate Handshake on start
                 self.log("Starting Tunnel: Sending Handshake...")
-                hs_header = struct.pack("!2s B B I B B H", PROTOCOL_MAGIC, PROTOCOL_VERSION, TYPE_HANDSHAKE, 0, 0, 1, 7)
+                hs_header = struct.pack("!2s B B I I B B H", PROTOCOL_MAGIC, PROTOCOL_VERSION, TYPE_HANDSHAKE, 0, 0, 0, 1, 7)
                 self.send_qr_frame(cam, hs_header + b"SYNC_V1")
                 
                 while self.running:
