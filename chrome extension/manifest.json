@@ -1,13 +1,19 @@
 {
   "manifest_version": 3,
-  "name": "MeeTunnel Capture",
+  "name": "MeeTunnel Sidebar",
   "version": "1.0",
-  "permissions": ["activeTab"],
+  "description": "Control QR Capture directly from the Google Meet sidebar.",
+  "permissions": ["sidePanel", "activeTab", "scripting"],
+  "background": {
+    "service_worker": "background.js"
+  },
   "content_scripts": [
     {
-      "matches": ["https://meet.google.com/*", "http://localhost/*"],
+      "matches": ["https://meet.google.com/*"],
       "js": ["content.js"]
     }
   ],
-  "host_permissions": ["http://127.0.0.1:5001/"]
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  }
 }

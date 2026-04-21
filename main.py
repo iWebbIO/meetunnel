@@ -38,14 +38,23 @@ class QRTunnelGUI:
         self.tab_control.add(self.recv_tab, text='Receiver (QR -> Data)')
         self.tab_control.pack(expand=1, fill="both")
         
+        self.stats = {"sent": 0, "recv": 0, "errors": 0}
         self.reassembly_buffer = {} # {pkt_id: {"data": [frags], "timestamp": time.time()}}
         self.frame_lock = threading.Lock()
         self.web_frame = None
         self.use_web_capture = tk.BooleanVar(value=False)
+        
         self.setup_send_tab()
         self.setup_recv_tab()
         
-        # Log Window
+        # Status Bar
+        self.status_frame = ttk.Frame(root)
+        self.status_frame.pack(fill="x", padx=10)
+        self.lbl_status = ttk.Label(self.status_frame, text="STATUS: IDLE", foreground="blue", font=('Helvetica', 10, 'bold'))
+        self.lbl_status.pack(side="left")
+        self.lbl_stats = ttk.Label(self.status_frame, text="S: 0 | R: 0 | E: 0")
+        self.lbl_stats.pack(side="right")
+
         self.log_area = scrolledtext.ScrolledText(root, height=12)
         self.log_area.pack(fill="both", padx=10, pady=10)
         self.log("System Ready. Please install UnityCapture before starting.")
@@ -53,6 +62,9 @@ class QRTunnelGUI:
     def log(self, message):
         self.log_area.insert(tk.END, f"[{time.strftime('%H:%M:%S')}] {message}\n")
         self.log_area.see(tk.END)
+
+    def update_stats_ui(self):
+        self.lbl_stats.config(text=f"Sent: {self.stats['sent']} | Recv: {self.stats['recv']} | Err: {self.stats['errors']}")
 
     def setup_send_tab(self):
         ttk.Label(self.send_tab, text="UDP Listen IP:").grid(column=0, row=0, padx=10, pady=5)
@@ -145,9 +157,11 @@ class QRTunnelGUI:
         if not self.running:
             self.running = True
             self.btn_send.config(text="Stop Sender")
+            self.lbl_status.config(text="STATUS: SENDER ACTIVE", foreground="green")
             threading.Thread(target=self.run_sender_logic, daemon=True).start()
         else:
             self.running = False
+            self.lbl_status.config(text="STATUS: IDLE", foreground="blue")
             self.btn_send.config(text="Start Sender")
 
     def toggle_receiver(self):
@@ -156,9 +170,11 @@ class QRTunnelGUI:
             self.btn_recv.config(text="Stop Receiver")
             if self.use_web_capture.get():
                 threading.Thread(target=self.run_web_server, daemon=True).start()
+            self.lbl_status.config(text="STATUS: RECEIVER ACTIVE", foreground="green")
             threading.Thread(target=self.run_receiver_logic, daemon=True).start()
         else:
             self.running = False
+            self.lbl_status.config(text="STATUS: IDLE", foreground="blue")
             self.btn_recv.config(text="Start Receiver")
 
     def run_web_server(self):
@@ -216,9 +232,11 @@ class QRTunnelGUI:
                         
                         self.log(f"Sending Pkt {seq} ({total_frags} frags)")
                         seq += 1 
+                        self.stats["sent"] += 1
                     except socket.timeout:
                         header = struct.pack("!2s B B I B B H", PROTOCOL_MAGIC, PROTOCOL_VERSION, TYPE_HANDSHAKE, 0, 0, 1, 7)
                         packet_datas = [header + b"SYNC_V1"]
+                        # Handshakes aren't counted in 'sent' stats to keep them meaningful
 
                     for p_data in packet_datas:
                         qr = qrcode.QRCode(version=10, error_correction=qrcode.constants.ERROR_CORRECT_H, box_size=10, border=2)
@@ -229,6 +247,7 @@ class QRTunnelGUI:
                         frame = cv2.resize(frame, (640, 480), interpolation=cv2.INTER_NEAREST)
                         cam.send(frame)
                         cam.sleep_until_next_frame()
+                    self.root.after(0, self.update_stats_ui)
 
         except Exception as e:
             self.log(f"Sender Error: {e}")
@@ -265,22 +284,26 @@ class QRTunnelGUI:
                 
                 # Detect and decode
                 data, bbox, _ = detector.detectAndDecode(frame)
+                if bbox is not None and not data:
+                    pass # Detected QR but couldn't decode - very common in low-res video
+
                 if data:
                     try:
                         raw_payload = data.encode('latin-1')
                         if len(raw_payload) >= 12:
                             magic, ver, ptype, pkt_id, f_idx, f_total, plen = struct.unpack("!2s B B I B B H", raw_payload[:12])
                             
-                            if magic == PROTOCOL_MAGIC and ver == PROTOCOL_VERSION:
-                                chunk_data = raw_payload[12:12+plen]
-                                
-                                if ptype == TYPE_HANDSHAKE:
-                                    if pkt_id < last_seq or last_seq == -1:
-                                        self.log("Handshake - Session Synchronized")
-                                        last_seq = pkt_id
-                                
-                                elif ptype == TYPE_DATA:
-                                    if pkt_id <= last_seq: continue
+                            if magic != PROTOCOL_MAGIC:
+                                self.log(f"Invalid Magic: {magic}")
+                                continue
+
+                            chunk_data = raw_payload[12:12+plen]
+                            if ptype == TYPE_HANDSHAKE:
+                                self.log(f"Handshake rx (Ver: {ver}) - Resyncing...")
+                                last_seq = -1 # Reset sequence to allow new stream
+                            
+                            elif ptype == TYPE_DATA:
+                                if pkt_id > last_seq:
                                     
                                     if pkt_id not in self.reassembly_buffer:
                                         self.reassembly_buffer[pkt_id] = {
@@ -296,6 +319,7 @@ class QRTunnelGUI:
                                         self.log(f"Reassembled Pkt {pkt_id} ({len(full_packet)} bytes)")
                                         last_seq = pkt_id
                                         del self.reassembly_buffer[pkt_id]
+                                        self.stats["recv"] += 1
 
                         # Periodically clean up stale fragments (older than 5s)
                         now = time.time()
@@ -304,7 +328,9 @@ class QRTunnelGUI:
                                     
                     except Exception as e:
                         self.log(f"Protocol Error: {e}")
+                        self.stats["errors"] += 1
                 
+                self.root.after(0, self.update_stats_ui)
                 time.sleep(0.03) # ~30 FPS scan rate
 
 if __name__ == "__main__":

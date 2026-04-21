@@ -1,9 +1,33 @@
-console.log("MeeTunnel Capture Extension Active");
+let isCapturing = false;
+let captureInterval = null;
 
 const canvas = document.createElement('canvas');
 const ctx = canvas.getContext('2d');
 
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+    if (request.action === "toggle") {
+        isCapturing = request.state;
+        if (isCapturing) startLoop();
+        else stopLoop();
+        sendResponse({status: "ok"});
+    }
+});
+
+function startLoop() {
+    if (captureInterval) return;
+    captureInterval = setInterval(captureFrame, 66);
+    console.log("MeeTunnel: Capture Started");
+}
+
+function stopLoop() {
+    clearInterval(captureInterval);
+    captureInterval = null;
+    console.log("MeeTunnel: Capture Stopped");
+}
+
 async function captureFrame() {
+    if (!isCapturing) return;
+
     // Find the largest video element (likely the main speaker or presentation)
     const videos = Array.from(document.querySelectorAll('video'));
     let video = null;
@@ -32,11 +56,9 @@ async function captureFrame() {
                 body: dataUrl,
                 headers: { 'Content-Type': 'text/plain' }
             });
+            chrome.runtime.sendMessage({type: "stats", status: "Active", lastPulse: Date.now()});
         } catch (e) {
-            console.error("Python Receiver not reachable");
+            chrome.runtime.sendMessage({type: "stats", status: "Python Unreachable"});
         }
     }
-    setTimeout(captureFrame, 66); // ~15 FPS
 }
-
-captureFrame();
