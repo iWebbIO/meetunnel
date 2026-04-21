@@ -76,6 +76,10 @@ class QRTunnelGUI:
         self.log_area = scrolledtext.ScrolledText(root, height=12)
         self.log_area.pack(fill="both", padx=10, pady=10)
         self.log("System Ready. Please install UnityCapture before starting.")
+        
+        # Auto-start logic for automation
+        if "--host" in sys.argv:
+            self.root.after(1000, self.auto_start_host)
 
     def log(self, message):
         self.log_area.insert(tk.END, f"[{time.strftime('%H:%M:%S')}] {message}\n")
@@ -94,6 +98,13 @@ class QRTunnelGUI:
             self.running = False
             self.socks5_active = False
             self.btn_duplex.config(text="🚀 START AUTOMATIC DUPLEX TUNNEL")
+
+    def auto_start_host(self):
+        """Automated trigger for failsafe host deployment."""
+        self.role.set("host")
+        self.use_web_capture.set(True) # Usually safer for automated hosts
+        self.log("AUTOMATION: CLI flag detected. Starting Host Tunnel...")
+        self.toggle_duplex()
 
     def update_stats_ui(self):
         self.lbl_stats.config(text=f"Sent: {self.stats['sent']} | Recv: {self.stats['recv']} | Err: {self.stats['errors']}")
@@ -309,15 +320,15 @@ class QRTunnelGUI:
         seq = 0
         self.log(f"Sender active on {ip}:{port}")
         
-        try:
-            # Connect to the virtual camera filter
-            with pyvirtualcam.Camera(width=640, height=480, fps=20, device="Unity Video Capture") as cam:
-                # Immediate Handshake on start
-                self.log("Starting Tunnel: Sending Handshake...")
-                hs_header = struct.pack("!2s B B I I B B H", PROTOCOL_MAGIC, PROTOCOL_VERSION, TYPE_HANDSHAKE, 0, 0, 0, 1, 7)
-                self.send_qr_frame(cam, hs_header + b"SYNC_V1")
-                
-                while self.running:
+        while self.running:
+            try:
+                # Connect to the virtual camera filter with a retry loop
+                with pyvirtualcam.Camera(width=640, height=480, fps=20, device="Unity Video Capture") as cam:
+                    self.log("Virtual Camera initialized successfully.")
+                    while self.running:
+                        packet_datas = []
+                        try:
+                            ptype, stream_id, full_data, current_pkt_id = TYPE_DATA, 0, b"", 0
                     packet_datas = []
                     try:
                         ptype, stream_id, full_data, current_pkt_id = TYPE_DATA, 0, b"", 0
@@ -368,17 +379,21 @@ class QRTunnelGUI:
                         self.log(f"TX Pkt {current_pkt_id} ({total_frags} frags) Type {ptype}")
                         self.stats["sent"] += 1
                     except socket.timeout:
-                        header = struct.pack("!2s B B I I B B H", PROTOCOL_MAGIC, PROTOCOL_VERSION, TYPE_HANDSHAKE, 0, 0, 0, 1, 7)
-                        packet_datas = [header + b"SYNC_V1"]
+                        # HEARTBEAT: Send handshake every 2 seconds when idle to help receiver sync
+                        now_ts = int(time.time())
+                            # HEARTBEAT: Send handshake every 2 seconds when idle to help receiver sync
+                            now_ts = int(time.time())
+                            header = struct.pack("!2s B B I I B B H", PROTOCOL_MAGIC, PROTOCOL_VERSION, TYPE_HANDSHAKE, now_ts, 0, 0, 1, 7)
+                            packet_datas = [header + b"HEARTBT"]
 
-                    for p_data in packet_datas:
-                        self.send_qr_frame(cam, p_data)
-                        
-                    self.root.after(0, self.update_stats_ui)
-
-        except Exception as e:
-            self.log(f"Sender Error: {e}")
-            self.running = False
+                        for p_data in packet_datas:
+                            self.send_qr_frame(cam, p_data)
+                            
+                        self.root.after(0, self.update_stats_ui)
+            except Exception as e:
+                if not self.running: break
+                self.log(f"Sender Hardware Error: {e}. Retrying in 5s...")
+                time.sleep(5)
 
     def send_qr_frame(self, cam, p_data):
         # Using Error Correct 'H' (30% recovery) is vital for video conferencing compression
@@ -386,8 +401,17 @@ class QRTunnelGUI:
         qr.add_data(p_data.decode('latin-1'))
         qr.make(fit=True)
         img = qr.make_image(fill_color="black", back_color="white").convert('RGB')
-        frame = np.array(img)
-        frame = cv2.resize(frame, (640, 480), interpolation=cv2.INTER_NEAREST)
+        qr_img = np.array(img)
+        
+        # Create a white background frame (480 height, 640 width)
+        frame = np.full((480, 640, 3), 255, dtype=np.uint8)
+        
+        # Resize QR to 480x480 to maintain 1:1 aspect ratio
+        qr_resized = cv2.resize(qr_img, (480, 480), interpolation=cv2.INTER_NEAREST)
+        
+        # Center the QR code horizontally (80px padding on each side: (640-480)/2)
+        frame[0:480, 80:560] = qr_resized
+        
         cam.send(frame)
         time.sleep(0.06) # Explicitly cap at ~15fps to allow receiver processing time
 
@@ -474,123 +498,101 @@ class QRTunnelGUI:
         # OpenCV built-in detector (No libiconv.dll required)
         detector = cv2.QRCodeDetector()
         
-        self.log("Receiver scanning screen...")
+        self.log("Receiver started. Waiting for sync...")
         last_seq = -1
         
-        with mss.mss() as sct:
-            while self.running:
+        while self.running:
+            try:
                 frame = None
-                if self.use_web_capture.get():
-                    with self.frame_lock:
-                        if self.web_frame is not None:
-                            frame = self.web_frame.copy()
-                
-                if frame is None:
-                    monitor = {
-                        "top": int(self.coords["Top:"].get()),
-                        "left": int(self.coords["Left:"].get()),
-                        "width": int(self.coords["Width:"].get()),
-                        "height": int(self.coords["Height:"].get())
-                    }
-                    sct_img = sct.grab(monitor)
-                    frame = np.array(sct_img)
-                    frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-                
-                # Detect and decode
-                # PRE-PROCESSING: Convert to grayscale and apply threshold to combat video blur
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
-                
-                data, bbox, _ = detector.detectAndDecode(thresh)
-                if not data: # Try without threshold if first attempt fails
-                    data, bbox, _ = detector.detectAndDecode(frame)
+                with mss.mss() as sct:
+                    while self.running:
+                        if self.use_web_capture.get():
+                            with self.frame_lock:
+                                if self.web_frame is not None:
+                                    frame = self.web_frame.copy()
+                        
+                        if frame is None:
+                            monitor = {
+                                "top": int(self.coords["Top:"].get()),
+                                "left": int(self.coords["Left:"].get()),
+                                "width": int(self.coords["Width:"].get()),
+                                "height": int(self.coords["Height:"].get())
+                            }
+                            sct_img = sct.grab(monitor)
+                            frame = np.array(sct_img)
+                            frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+                        
+                        # Detect and decode
+                        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                        _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
+                        
+                        data, bbox, _ = detector.detectAndDecode(thresh)
+                        if not data:
+                            data, bbox, _ = detector.detectAndDecode(frame)
 
-                if data:
-                    try:
-                        # Use latin-1 to preserve raw bytes from the sender
-                        try:
-                            raw_payload = data.encode('latin-1')
-                        except UnicodeEncodeError:
-                            continue # Skip malformed decodes
+                        if data:
+                            try:
+                                raw_payload = data.encode('latin-1')
+                                if len(raw_payload) >= 16:
+                                    magic, ver, ptype, pkt_id, stream_id, f_idx, f_total, plen = struct.unpack("!2s B B I I B B H", raw_payload[:16])
+                                    if magic != PROTOCOL_MAGIC: continue
+                                    chunk_data = raw_payload[16:16+plen]
 
-                        if len(raw_payload) >= 16:
-                            magic, ver, ptype, pkt_id, stream_id, f_idx, f_total, plen = struct.unpack("!2s B B I I B B H", raw_payload[:16])
-                            
-                            if magic != PROTOCOL_MAGIC: continue
-
-                            chunk_data = raw_payload[16:16+plen]
-                            if ptype == TYPE_HANDSHAKE:
-                                # Only reset if significantly behind to avoid jitter resets
-                                if pkt_id < last_seq - 100: last_seq = -1
-                            
-                            # Ensure we ACK packets we've already seen to stop sender retransmission
-                            elif pkt_id <= last_seq and ptype != TYPE_ACK:
-                                self.outgoing_queue.put((TYPE_ACK, 0, struct.pack("!I", pkt_id)))
-                                continue
-
-                            if ptype == TYPE_TCP_CONNECT and self.role.get() == "host":
-                                # Control packets are small and don't fragment; ACK immediately
-                                self.log(f"RX Connect Request for Stream {stream_id}. Sending ACK.")
-                                self.outgoing_queue.put((TYPE_ACK, 0, struct.pack("!I", pkt_id)))
-                                last_seq = pkt_id
-                                target_str = chunk_data.decode(errors='ignore')
-                                if ":" in target_str:
-                                    threading.Thread(target=self.run_host_exit, args=(stream_id, target_str), daemon=True).start()
-
-                            elif ptype == TYPE_TCP_FIN:
-                                self.log(f"RX FIN for Stream {stream_id}. Sending ACK.")
-                                self.outgoing_queue.put((TYPE_ACK, 0, struct.pack("!I", pkt_id)))
-                                last_seq = pkt_id
-                                if stream_id in self.active_streams:
-                                    self.active_streams[stream_id].close()
-                                    del self.active_streams[stream_id]
-                            
-                            elif ptype == TYPE_ACK:
-                                with self.unacked_lock:
-                                    if pkt_id in self.unacked_packets:
-                                        self.log(f"ACK Received for Pkt {pkt_id}")
-                                        del self.unacked_packets[pkt_id]
-
-                            elif ptype == TYPE_DATA:
-                                if pkt_id > last_seq:
+                                    if ptype == TYPE_HANDSHAKE:
+                                        if pkt_id > last_seq: last_seq = pkt_id - 1
                                     
-                                    if pkt_id not in self.reassembly_buffer:
-                                        self.reassembly_buffer[pkt_id] = {
-                                            "frags": [None] * f_total,
-                                            "timestamp": time.time()
-                                        }
-                                    
-                                    self.reassembly_buffer[pkt_id]["frags"][f_idx] = chunk_data
-                                    
-                                    if all(f is not None for f in self.reassembly_buffer[pkt_id]["frags"]):
-                                        full_packet = b''.join(self.reassembly_buffer[pkt_id]["frags"])
-                                        
-                                        # Route to specific TCP stream or general UDP port
-                                        if stream_id in self.active_streams:
-                                            self.active_streams[stream_id].sendall(full_packet)
-                                        else:
-                                            sock.sendto(full_packet, ("127.0.0.1", port))
-                                            
-                                        self.log(f"RX Pkt {pkt_id} Reassembled. Sending ACK.")
-                                        
-                                        # Send ACK back through the tunnel
+                                    elif pkt_id <= last_seq and ptype != TYPE_ACK:
                                         self.outgoing_queue.put((TYPE_ACK, 0, struct.pack("!I", pkt_id)))
-                                        
-                                        last_seq = pkt_id
-                                        del self.reassembly_buffer[pkt_id]
-                                        self.stats["recv"] += 1
+                                        continue
 
-                        # Periodically clean up stale fragments (older than 5s)
-                        now = time.time()
-                        stale_ids = [k for k, v in self.reassembly_buffer.items() if now - v["timestamp"] > 5.0]
-                        for k in stale_ids: del self.reassembly_buffer[k]
+                                    if ptype == TYPE_TCP_CONNECT and self.role.get() == "host":
+                                        self.outgoing_queue.put((TYPE_ACK, 0, struct.pack("!I", pkt_id)))
+                                        last_seq = pkt_id
+                                        target_str = chunk_data.decode(errors='ignore')
+                                        if ":" in target_str:
+                                            threading.Thread(target=self.run_host_exit, args=(stream_id, target_str), daemon=True).start()
+
+                                    elif ptype == TYPE_TCP_FIN:
+                                        self.outgoing_queue.put((TYPE_ACK, 0, struct.pack("!I", pkt_id)))
+                                        last_seq = pkt_id
+                                        if stream_id in self.active_streams:
+                                            self.active_streams[stream_id].close()
+                                            del self.active_streams[stream_id]
                                     
-                    except Exception as e:
-                        self.log(f"Protocol Error: {e}")
-                        self.stats["errors"] += 1
-                
-                self.root.after(0, self.update_stats_ui)
-                time.sleep(0.03) # ~30 FPS scan rate
+                                    elif ptype == TYPE_ACK:
+                                        with self.unacked_lock:
+                                            if pkt_id in self.unacked_packets: del self.unacked_packets[pkt_id]
+
+                                    elif ptype == TYPE_DATA:
+                                        if pkt_id > last_seq:
+                                            if pkt_id not in self.reassembly_buffer:
+                                                self.reassembly_buffer[pkt_id] = {"frags": [None] * f_total, "timestamp": time.time()}
+                                            self.reassembly_buffer[pkt_id]["frags"][f_idx] = chunk_data
+                                            
+                                            if all(f is not None for f in self.reassembly_buffer[pkt_id]["frags"]):
+                                                full_packet = b''.join(self.reassembly_buffer[pkt_id]["frags"])
+                                                if stream_id in self.active_streams:
+                                                    self.active_streams[stream_id].sendall(full_packet)
+                                                else:
+                                                    sock.sendto(full_packet, ("127.0.0.1", port))
+                                                
+                                                self.outgoing_queue.put((TYPE_ACK, 0, struct.pack("!I", pkt_id)))
+                                                last_seq = pkt_id
+                                                del self.reassembly_buffer[pkt_id]
+                                                self.stats["recv"] += 1
+
+                                # Periodic cleanup
+                                now = time.time()
+                                stale_ids = [k for k, v in self.reassembly_buffer.items() if now - v["timestamp"] > 5.0]
+                                for k in stale_ids: del self.reassembly_buffer[k]
+                            except Exception: pass
+                        
+                        self.root.after(0, self.update_stats_ui)
+                        time.sleep(0.03)
+            except Exception as e:
+                if not self.running: break
+                self.log(f"Receiver Error: {e}. Recovering...")
+                time.sleep(2)
 
 if __name__ == "__main__":
     root = tk.Tk()

@@ -42,14 +42,14 @@ function stopLoop() {
 async function captureFrame() {
     if (!isCapturing) return;
 
-    // Find the largest video element (likely the main speaker or presentation)
+    // Automated search for the largest video element (prioritizes active streams)
     const videos = Array.from(document.querySelectorAll('video'));
     let video = null;
     let maxArea = 0;
 
     videos.forEach(v => {
-        const area = v.offsetWidth * v.offsetHeight;
-        if (area > maxArea) {
+        const area = v.videoWidth * v.videoHeight; // Use intrinsic size for better detection
+        if (area > maxArea && v.readyState >= 2) {
             maxArea = area;
             video = v;
         }
