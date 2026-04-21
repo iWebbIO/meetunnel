@@ -511,12 +511,24 @@ class QRTunnelGUI:
                                 # Only reset if significantly behind to avoid jitter resets
                                 if pkt_id < last_seq - 100: last_seq = -1
                             
-                            elif ptype == TYPE_TCP_CONNECT and self.role.get() == "host":
+                            # Ensure we ACK packets we've already seen to stop sender retransmission
+                            elif pkt_id <= last_seq and ptype != TYPE_ACK:
+                                self.outgoing_queue.put((TYPE_ACK, 0, struct.pack("!I", pkt_id)))
+                                continue
+
+                            if ptype == TYPE_TCP_CONNECT and self.role.get() == "host":
+                                # Control packets are small and don't fragment; ACK immediately
+                                self.log(f"RX Connect Request for Stream {stream_id}. Sending ACK.")
+                                self.outgoing_queue.put((TYPE_ACK, 0, struct.pack("!I", pkt_id)))
+                                last_seq = pkt_id
                                 target_str = chunk_data.decode(errors='ignore')
                                 if ":" in target_str:
                                     threading.Thread(target=self.run_host_exit, args=(stream_id, target_str), daemon=True).start()
 
                             elif ptype == TYPE_TCP_FIN:
+                                self.log(f"RX FIN for Stream {stream_id}. Sending ACK.")
+                                self.outgoing_queue.put((TYPE_ACK, 0, struct.pack("!I", pkt_id)))
+                                last_seq = pkt_id
                                 if stream_id in self.active_streams:
                                     self.active_streams[stream_id].close()
                                     del self.active_streams[stream_id]
