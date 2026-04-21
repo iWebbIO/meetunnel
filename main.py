@@ -305,12 +305,16 @@ class QRTunnelGUI:
                 while self.running:
                     packet_datas = []
                     try:
-                        # Check internal queue first (TCP data), then external UDP port
+                        # Try to get data from internal queue (TCP) OR external UDP socket
+                        ptype, stream_id, full_data = TYPE_DATA, 0, b""
+                        
                         try:
                             ptype, stream_id, full_data = self.outgoing_queue.get(timeout=0.05)
                         except queue.Empty:
-                            full_data, addr = sock.recvfrom(2048)
-                            ptype, stream_id = TYPE_DATA, 0
+                            try:
+                                full_data, addr = sock.recvfrom(2048)
+                            except socket.timeout:
+                                raise socket.timeout # Re-raise to trigger handshake logic
 
                         chunk_size = 300 # Slightly smaller for better reliability
                         total_frags = math.ceil(len(full_data) / chunk_size)
@@ -473,11 +477,13 @@ class QRTunnelGUI:
 
                             chunk_data = raw_payload[16:16+plen]
                             if ptype == TYPE_HANDSHAKE:
-                                last_seq = -1
+                                # Only reset if significantly behind to avoid jitter resets
+                                if pkt_id < last_seq - 100: last_seq = -1
                             
                             elif ptype == TYPE_TCP_CONNECT and self.role.get() == "host":
-                                target_str = chunk_data.decode()
-                                threading.Thread(target=self.run_host_exit, args=(stream_id, target_str), daemon=True).start()
+                                target_str = chunk_data.decode(errors='ignore')
+                                if ":" in target_str:
+                                    threading.Thread(target=self.run_host_exit, args=(stream_id, target_str), daemon=True).start()
 
                             elif ptype == TYPE_TCP_FIN:
                                 if stream_id in self.active_streams:
