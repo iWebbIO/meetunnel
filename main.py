@@ -20,11 +20,12 @@ import mss
 
 # Protocol Constants
 PROTOCOL_MAGIC = b'QN'
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 TYPE_HANDSHAKE = 1
 TYPE_DATA = 2
 TYPE_TCP_CONNECT = 3
 TYPE_TCP_FIN = 4
+TYPE_ACK = 5
 
 class QRTunnelGUI:
     def __init__(self, root):
@@ -50,6 +51,8 @@ class QRTunnelGUI:
         self.reassembly_buffer = {} # {pkt_id: {"data": [frags], "timestamp": time.time()}}
         self.active_streams = {}    # {stream_id: socket}
         self.outgoing_queue = queue.Queue()
+        self.unacked_packets = {}   # {pkt_id: (timestamp, ptype, stream_id, data)}
+        self.unacked_lock = threading.Lock()
         self.frame_lock = threading.Lock()
         self.web_frame = None
         self.use_web_capture = tk.BooleanVar(value=False)
@@ -305,11 +308,24 @@ class QRTunnelGUI:
                 while self.running:
                     packet_datas = []
                     try:
-                        # Try to get data from internal queue (TCP) OR external UDP socket
                         ptype, stream_id, full_data = TYPE_DATA, 0, b""
                         
                         try:
                             ptype, stream_id, full_data = self.outgoing_queue.get(timeout=0.05)
+                        except queue.Empty:
+                            # Check for retransmissions: if a packet isn't ACKed for 1.5s, resend it
+                            now = time.time()
+                            with self.unacked_lock:
+                                for pid, info in list(self.unacked_packets.items()):
+                                    ts, old_ptype, old_sid, old_data = info
+                                    if now - ts > 1.5:
+                                        self.log(f"Retransmitting Pkt {pid}...")
+                                        ptype, stream_id, full_data = old_ptype, old_sid, old_data
+                                        self.unacked_packets[pid] = (now, ptype, stream_id, full_data)
+                                        break
+                                else:
+                                    raise socket.timeout 
+
                         except queue.Empty:
                             try:
                                 full_data, addr = sock.recvfrom(2048)
@@ -320,6 +336,11 @@ class QRTunnelGUI:
                         chunk_size = 180 
                         total_frags = math.ceil(len(full_data) / chunk_size)
                         
+                        # Store for reliability tracking (if not already an ACK)
+                        if ptype != TYPE_ACK:
+                            with self.unacked_lock:
+                                self.unacked_packets[seq] = (time.time(), ptype, stream_id, full_data)
+
                         for i in range(total_frags):
                             chunk = full_data[i*chunk_size : (i+1)*chunk_size]
                             # Header v2.0: Magic(2), Ver(1), Type(1), PktID(4), StreamID(4), FragIdx(1), FragTotal(1), Len(2)
@@ -462,7 +483,13 @@ class QRTunnelGUI:
                     frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
                 
                 # Detect and decode
-                data, bbox, _ = detector.detectAndDecode(frame)
+                # PRE-PROCESSING: Convert to grayscale and apply threshold to combat video blur
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
+                
+                data, bbox, _ = detector.detectAndDecode(thresh)
+                if not data: # Try without threshold if first attempt fails
+                    data, bbox, _ = detector.detectAndDecode(frame)
 
                 if data:
                     try:
@@ -492,6 +519,12 @@ class QRTunnelGUI:
                                     self.active_streams[stream_id].close()
                                     del self.active_streams[stream_id]
                             
+                            elif ptype == TYPE_ACK:
+                                with self.unacked_lock:
+                                    if pkt_id in self.unacked_packets:
+                                        self.log(f"ACK Received for Pkt {pkt_id}")
+                                        del self.unacked_packets[pkt_id]
+
                             elif ptype == TYPE_DATA:
                                 if pkt_id > last_seq:
                                     
@@ -512,7 +545,11 @@ class QRTunnelGUI:
                                         else:
                                             sock.sendto(full_packet, ("127.0.0.1", port))
                                             
-                                        self.log(f"RX Pkt {pkt_id} | Stream {stream_id} | {len(full_packet)}b")
+                                        self.log(f"RX Pkt {pkt_id} Reassembled. Sending ACK.")
+                                        
+                                        # Send ACK back through the tunnel
+                                        self.outgoing_queue.put((TYPE_ACK, 0, struct.pack("!I", pkt_id)))
+                                        
                                         last_seq = pkt_id
                                         del self.reassembly_buffer[pkt_id]
                                         self.stats["recv"] += 1
