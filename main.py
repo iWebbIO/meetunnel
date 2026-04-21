@@ -11,6 +11,7 @@ import base64
 import math
 import struct
 import select
+import queue
 
 # Requirements: pip install qrcode pyvirtualcam opencv-python mss numpy
 import qrcode
@@ -19,15 +20,17 @@ import mss
 
 # Protocol Constants
 PROTOCOL_MAGIC = b'QN'
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 TYPE_HANDSHAKE = 1
 TYPE_DATA = 2
+TYPE_TCP_CONNECT = 3
+TYPE_TCP_FIN = 4
 
 class QRTunnelGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("MeeTunnel v1.0")
-        self.root.geometry("500x650")
+        self.root.geometry("500x700")
         self.running = False
         self.socks5_active = False
         self.role = tk.StringVar(value="host")
@@ -45,6 +48,8 @@ class QRTunnelGUI:
         
         self.stats = {"sent": 0, "recv": 0, "errors": 0}
         self.reassembly_buffer = {} # {pkt_id: {"data": [frags], "timestamp": time.time()}}
+        self.active_streams = {}    # {stream_id: socket}
+        self.outgoing_queue = queue.Queue()
         self.frame_lock = threading.Lock()
         self.web_frame = None
         self.use_web_capture = tk.BooleanVar(value=False)
@@ -61,6 +66,9 @@ class QRTunnelGUI:
         self.lbl_stats = ttk.Label(self.status_frame, text="S: 0 | R: 0 | E: 0")
         self.lbl_stats.pack(side="right")
 
+        self.btn_duplex = ttk.Button(root, text="🚀 START AUTOMATIC DUPLEX TUNNEL", command=self.toggle_duplex)
+        self.btn_duplex.pack(fill="x", padx=10, pady=5)
+
         self.log_area = scrolledtext.ScrolledText(root, height=12)
         self.log_area.pack(fill="both", padx=10, pady=10)
         self.log("System Ready. Please install UnityCapture before starting.")
@@ -68,6 +76,20 @@ class QRTunnelGUI:
     def log(self, message):
         self.log_area.insert(tk.END, f"[{time.strftime('%H:%M:%S')}] {message}\n")
         self.log_area.see(tk.END)
+
+    def toggle_duplex(self):
+        """Starts both Sender and Receiver automatically for two-way communication."""
+        if not self.running:
+            self.log(f"Starting Duplex Tunnel as {self.role.get().upper()}...")
+            self.toggle_sender()
+            self.toggle_receiver()
+            if self.role.get() == "client":
+                self.toggle_socks5()
+            self.btn_duplex.config(text="🛑 STOP TUNNEL")
+        else:
+            self.running = False
+            self.socks5_active = False
+            self.btn_duplex.config(text="🚀 START AUTOMATIC DUPLEX TUNNEL")
 
     def update_stats_ui(self):
         self.lbl_stats.config(text=f"Sent: {self.stats['sent']} | Recv: {self.stats['recv']} | Err: {self.stats['errors']}")
@@ -283,24 +305,31 @@ class QRTunnelGUI:
                 while self.running:
                     packet_datas = []
                     try:
-                        # Increase buffer to handle standard MTU sizes
-                        full_data, addr = sock.recvfrom(2048) 
+                        # Check internal queue first (TCP data), then external UDP port
+                        try:
+                            ptype, stream_id, full_data = self.outgoing_queue.get(timeout=0.05)
+                        except queue.Empty:
+                            full_data, addr = sock.recvfrom(2048)
+                            ptype, stream_id = TYPE_DATA, 0
+
                         chunk_size = 300 # Slightly smaller for better reliability
                         total_frags = math.ceil(len(full_data) / chunk_size)
                         
                         for i in range(total_frags):
                             chunk = full_data[i*chunk_size : (i+1)*chunk_size]
-                            # Header v1.1: Magic(2), Ver(1), Type(1), PktID(4), FragIdx(1), FragTotal(1), Len(2)
-                            header = struct.pack("!2s B B I B B H", PROTOCOL_MAGIC, PROTOCOL_VERSION, TYPE_DATA, seq, i, total_frags, len(chunk))
+                            # Header v2.0: Magic(2), Ver(1), Type(1), PktID(4), StreamID(4), FragIdx(1), FragTotal(1), Len(2)
+                            header = struct.pack("!2s B B I I B B H", 
+                                PROTOCOL_MAGIC, PROTOCOL_VERSION, ptype, 
+                                seq, stream_id, i, total_frags, len(chunk)
+                            )
                             packet_datas.append(header + chunk)
                         
                         self.log(f"Sending Pkt {seq} ({total_frags} frags)")
                         seq += 1 
                         self.stats["sent"] += 1
                     except socket.timeout:
-                        header = struct.pack("!2s B B I B B H", PROTOCOL_MAGIC, PROTOCOL_VERSION, TYPE_HANDSHAKE, 0, 0, 1, 7)
+                        header = struct.pack("!2s B B I I B B H", PROTOCOL_MAGIC, PROTOCOL_VERSION, TYPE_HANDSHAKE, 0, 0, 0, 1, 7)
                         packet_datas = [header + b"SYNC_V1"]
-                        # Handshakes aren't counted in 'sent' stats to keep them meaningful
 
                     for p_data in packet_datas:
                         self.send_qr_frame(cam, p_data)
@@ -340,41 +369,62 @@ class QRTunnelGUI:
             except Exception as e: self.log(f"Proxy Error: {e}")
 
     def handle_socks_client(self, conn, udp_out, target_udp):
+        stream_id = np.random.randint(1, 0xFFFFFFFF)
         try:
-            # 1. Greeting
             greeting = conn.recv(2)
-            if not greeting or greeting[0] != 0x05:
-                conn.close()
-                return
+            if not greeting or greeting[0] != 0x05: return
             
-            # Support 'No Auth' (0x00)
-            conn.recv(greeting[1]) 
+            conn.recv(greeting[1])
             conn.sendall(b"\x05\x00")
 
-            # 2. Connection Request
             cmd = conn.recv(4)
-            if not cmd or cmd[1] != 0x01: # 0x01 = CONNECT
-                conn.close()
-                return
+            if not cmd or cmd[1] != 0x01: return
 
-            # Read address (skipped for brevity, but needed to consume buffer)
+            # Target address extraction
             atyp = cmd[3]
-            if atyp == 0x01: conn.recv(4) # IPv4
-            elif atyp == 0x03: conn.recv(conn.recv(1)[0]) # Domain
-            conn.recv(2) # Port
+            if atyp == 0x01: addr = socket.inet_ntoa(conn.recv(4))
+            elif atyp == 0x03: addr = conn.recv(conn.recv(1)[0]).decode()
+            else: return
+            port = struct.unpack("!H", conn.recv(2))[0]
 
-            # 3. Reply Success (Tell the client we are connected)
+            # Notify Host to connect
+            self.log(f"SOCKS: Requesting connection to {addr}:{port}")
+            connect_payload = f"{addr}:{port}".encode()
+            self.outgoing_queue.put((TYPE_TCP_CONNECT, stream_id, connect_payload))
+            
+            self.active_streams[stream_id] = conn
             conn.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
 
-            # 4. Data Loop
             while self.socks5_active:
                 data = conn.recv(4096)
                 if not data: break
-                udp_out.sendto(data, target_udp)
+                self.outgoing_queue.put((TYPE_DATA, stream_id, data))
         except Exception as e:
-            self.log(f"SOCKS Handler Error: {e}")
+            self.log(f"Stream {stream_id} Closed: {e}")
         finally:
+            self.outgoing_queue.put((TYPE_TCP_FIN, stream_id, b"END"))
+            if stream_id in self.active_streams: del self.active_streams[stream_id]
             conn.close()
+
+    def run_host_exit(self, stream_id, target_str):
+        """Host-side logic: Connects to the real internet and pipes back to QR."""
+        try:
+            addr, port = target_str.split(":")
+            remote_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            remote_sock.settimeout(5.0)
+            remote_sock.connect((addr, int(port)))
+            self.active_streams[stream_id] = remote_sock
+            self.log(f"Host: Connected to {target_str} for Stream {stream_id}")
+
+            while self.running:
+                data = remote_sock.recv(4096)
+                if not data: break
+                self.outgoing_queue.put((TYPE_DATA, stream_id, data))
+        except Exception as e:
+            self.log(f"Host Exit Error ({stream_id}): {e}")
+        finally:
+            if stream_id in self.active_streams: del self.active_streams[stream_id]
+            remote_sock.close()
 
     def run_receiver_logic(self):
         port = int(self.recv_port.get())
@@ -416,17 +466,23 @@ class QRTunnelGUI:
                         except UnicodeEncodeError:
                             continue # Skip malformed decodes
 
-                        if len(raw_payload) >= 12:
-                            magic, ver, ptype, pkt_id, f_idx, f_total, plen = struct.unpack("!2s B B I B B H", raw_payload[:12])
+                        if len(raw_payload) >= 16:
+                            magic, ver, ptype, pkt_id, stream_id, f_idx, f_total, plen = struct.unpack("!2s B B I I B B H", raw_payload[:16])
                             
-                            if magic != PROTOCOL_MAGIC:
-                                self.log(f"Invalid Magic: {magic}")
-                                continue
+                            if magic != PROTOCOL_MAGIC: continue
 
-                            chunk_data = raw_payload[12:12+plen]
+                            chunk_data = raw_payload[16:16+plen]
                             if ptype == TYPE_HANDSHAKE:
-                                self.log(f"Handshake rx (Ver: {ver}) - Resyncing...")
-                                last_seq = -1 # Reset sequence to allow new stream
+                                last_seq = -1
+                            
+                            elif ptype == TYPE_TCP_CONNECT and self.role.get() == "host":
+                                target_str = chunk_data.decode()
+                                threading.Thread(target=self.run_host_exit, args=(stream_id, target_str), daemon=True).start()
+
+                            elif ptype == TYPE_TCP_FIN:
+                                if stream_id in self.active_streams:
+                                    self.active_streams[stream_id].close()
+                                    del self.active_streams[stream_id]
                             
                             elif ptype == TYPE_DATA:
                                 if pkt_id > last_seq:
@@ -441,8 +497,14 @@ class QRTunnelGUI:
                                     
                                     if all(f is not None for f in self.reassembly_buffer[pkt_id]["frags"]):
                                         full_packet = b''.join(self.reassembly_buffer[pkt_id]["frags"])
-                                        sock.sendto(full_packet, ("127.0.0.1", port))
-                                        self.log(f"Reassembled Pkt {pkt_id} ({len(full_packet)} bytes)")
+                                        
+                                        # Route to specific TCP stream or general UDP port
+                                        if stream_id in self.active_streams:
+                                            self.active_streams[stream_id].sendall(full_packet)
+                                        else:
+                                            sock.sendto(full_packet, ("127.0.0.1", port))
+                                            
+                                        self.log(f"RX Pkt {pkt_id} | Stream {stream_id} | {len(full_packet)}b")
                                         last_seq = pkt_id
                                         del self.reassembly_buffer[pkt_id]
                                         self.stats["recv"] += 1
