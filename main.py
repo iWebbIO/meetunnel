@@ -381,10 +381,8 @@ class QRTunnelGUI:
                     except socket.timeout:
                         # HEARTBEAT: Send handshake every 2 seconds when idle to help receiver sync
                         now_ts = int(time.time())
-                            # HEARTBEAT: Send handshake every 2 seconds when idle to help receiver sync
-                            now_ts = int(time.time())
-                            header = struct.pack("!2s B B I I B B H", PROTOCOL_MAGIC, PROTOCOL_VERSION, TYPE_HANDSHAKE, now_ts, 0, 0, 1, 7)
-                            packet_datas = [header + b"HEARTBT"]
+                        header = struct.pack("!2s B B I I B B H", PROTOCOL_MAGIC, PROTOCOL_VERSION, TYPE_HANDSHAKE, now_ts, 0, 0, 1, 7)
+                        packet_datas = [header + b"HEARTBT"]
 
                         for p_data in packet_datas:
                             self.send_qr_frame(cam, p_data)
