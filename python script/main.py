@@ -25,7 +25,7 @@ TYPE_DATA = 2
 class QRTunnelGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("QR Network Tunnel v1.0")
+        self.root.title("MeeTunnel v1.0")
         self.root.geometry("500x650")
         self.running = False
         
