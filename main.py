@@ -326,68 +326,65 @@ class QRTunnelGUI:
                 with pyvirtualcam.Camera(width=640, height=480, fps=20, device="Unity Video Capture") as cam:
                     self.log("Virtual Camera initialized successfully.")
                     while self.running:
-                        packet_datas = []
-                        try:
-                            ptype, stream_id, full_data, current_pkt_id = TYPE_DATA, 0, b"", 0
-                    packet_datas = []
-                    try:
-                        ptype, stream_id, full_data, current_pkt_id = TYPE_DATA, 0, b"", 0
-                        
-                        try:
-                            # 1. Check for fresh data from the queue (TCP/SOCKS)
-                            ptype, stream_id, full_data = self.outgoing_queue.get(timeout=0.05)
-                            current_pkt_id = seq
-                            if ptype != TYPE_ACK:
-                                with self.unacked_lock:
-                                    self.unacked_packets[current_pkt_id] = (time.time(), ptype, stream_id, full_data)
-                                seq += 1
-                        except queue.Empty:
-                            # 2. Check for retransmissions: if a packet isn't ACKed for 1.5s, resend it
-                            now = time.time()
-                            with self.unacked_lock:
-                                for pid, info in list(self.unacked_packets.items()):
-                                    ts, old_ptype, old_sid, old_data = info
-                                    if now - ts > 2.0:  # Increased timeout to account for video lag
-                                        self.log(f"Retransmitting Pkt {pid}...")
-                                        ptype, stream_id, full_data, current_pkt_id = old_ptype, old_sid, old_data, pid
-                                        self.unacked_packets[pid] = (now, ptype, stream_id, full_data) # Update timestamp
-                                        break
-                                else:
-                                    # 3. Check for external UDP data
-                                    try:
-                                        full_data, addr = sock.recvfrom(2048)
-                                        current_pkt_id = seq
+                            packet_datas = []
+                            try:
+                                ptype, stream_id, full_data, current_pkt_id = TYPE_DATA, 0, b"", 0
+                                
+                                try:
+                                    # 1. Check for fresh data from the queue (TCP/SOCKS)
+                                    ptype, stream_id, full_data = self.outgoing_queue.get(timeout=0.05)
+                                    current_pkt_id = seq
+                                    if ptype != TYPE_ACK:
                                         with self.unacked_lock:
-                                            self.unacked_packets[current_pkt_id] = (time.time(), TYPE_DATA, 0, full_data)
+                                            self.unacked_packets[current_pkt_id] = (time.time(), ptype, stream_id, full_data)
                                         seq += 1
-                                    except socket.timeout:
-                                        raise socket.timeout 
+                                except queue.Empty:
+                                    # 2. Check for retransmissions: if a packet isn't ACKed for 1.5s, resend it
+                                    now = time.time()
+                                    with self.unacked_lock:
+                                        for pid, info in list(self.unacked_packets.items()):
+                                            ts, old_ptype, old_sid, old_data = info
+                                            if now - ts > 2.0:  # Increased timeout to account for video lag
+                                                self.log(f"Retransmitting Pkt {pid}...")
+                                                ptype, stream_id, full_data, current_pkt_id = old_ptype, old_sid, old_data, pid
+                                                self.unacked_packets[pid] = (now, ptype, stream_id, full_data) # Update timestamp
+                                                break
+                                        else:
+                                            # 3. Check for external UDP data
+                                            try:
+                                                full_data, addr = sock.recvfrom(2048)
+                                                current_pkt_id = seq
+                                                with self.unacked_lock:
+                                                    self.unacked_packets[current_pkt_id] = (time.time(), TYPE_DATA, 0, full_data)
+                                                seq += 1
+                                            except socket.timeout:
+                                                raise socket.timeout 
 
-                        # Smaller chunks + Lower QR Version = Larger, more readable blocks
-                        chunk_size = 150  # Smaller chunks make QR pixels larger/easier to read
-                        total_frags = math.ceil(len(full_data) / chunk_size)
+                                # Smaller chunks + Lower QR Version = Larger, more readable blocks
+                                chunk_size = 150  # Smaller chunks make QR pixels larger/easier to read
+                                total_frags = math.ceil(len(full_data) / chunk_size)
 
-                        for i in range(total_frags):
-                            chunk = full_data[i*chunk_size : (i+1)*chunk_size]
-                            # Header v2.0: Magic(2), Ver(1), Type(1), PktID(4), StreamID(4), FragIdx(1), FragTotal(1), Len(2)
-                            header = struct.pack("!2s B B I I B B H", 
-                                PROTOCOL_MAGIC, PROTOCOL_VERSION, ptype, 
-                                current_pkt_id, stream_id, i, total_frags, len(chunk)
-                            )
-                            packet_datas.append(header + chunk)
-                        
-                        self.log(f"TX Pkt {current_pkt_id} ({total_frags} frags) Type {ptype}")
-                        self.stats["sent"] += 1
-                    except socket.timeout:
-                        # HEARTBEAT: Send handshake every 2 seconds when idle to help receiver sync
-                        now_ts = int(time.time())
-                        header = struct.pack("!2s B B I I B B H", PROTOCOL_MAGIC, PROTOCOL_VERSION, TYPE_HANDSHAKE, now_ts, 0, 0, 1, 7)
-                        packet_datas = [header + b"HEARTBT"]
+                                for i in range(total_frags):
+                                    chunk = full_data[i*chunk_size : (i+1)*chunk_size]
+                                    # Header v2.0: Magic(2), Ver(1), Type(1), PktID(4), StreamID(4), FragIdx(1), FragTotal(1), Len(2)
+                                    header = struct.pack("!2s B B I I B B H", 
+                                        PROTOCOL_MAGIC, PROTOCOL_VERSION, ptype, 
+                                        current_pkt_id, stream_id, i, total_frags, len(chunk)
+                                    )
+                                    packet_datas.append(header + chunk)
+                                
+                                self.log(f"TX Pkt {current_pkt_id} ({total_frags} frags) Type {ptype}")
+                                self.stats["sent"] += 1
+                            except socket.timeout:
+                                # HEARTBEAT: Send handshake every 2 seconds when idle to help receiver sync
+                                now_ts = int(time.time())
+                                header = struct.pack("!2s B B I I B B H", PROTOCOL_MAGIC, PROTOCOL_VERSION, TYPE_HANDSHAKE, now_ts, 0, 0, 1, 7)
+                                packet_datas = [header + b"HEARTBT"]
 
-                        for p_data in packet_datas:
-                            self.send_qr_frame(cam, p_data)
-                            
-                        self.root.after(0, self.update_stats_ui)
+                            for p_data in packet_datas:
+                                self.send_qr_frame(cam, p_data)
+                                
+                            self.root.after(0, self.update_stats_ui)
             except Exception as e:
                 if not self.running: break
                 self.log(f"Sender Hardware Error: {e}. Retrying in 5s...")
