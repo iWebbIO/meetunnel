@@ -57,6 +57,7 @@ class QRTunnelGUI:
         self.frame_lock = threading.Lock()
         self.web_frame = None
         self.use_web_capture = tk.BooleanVar(value=False)
+        self.running = False
         
         self.setup_send_tab()
         self.setup_recv_tab()
