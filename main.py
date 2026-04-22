@@ -32,7 +32,7 @@ class QRTunnelGUI:
         self.root = root
         self.root.title("MeeTunnel v1.0")
         self.root.geometry("500x700")
-        self.running = False
+        self.stop_event = threading.Event()
         self.socks5_active = False
         self.role = tk.StringVar(value="host")
         
@@ -87,7 +87,8 @@ class QRTunnelGUI:
 
     def toggle_duplex(self):
         """Starts both Sender and Receiver automatically for two-way communication."""
-        if not self.running:
+        if not self.stop_event.is_set() and self.lbl_status.cget("text") == "STATUS: IDLE":
+            self.stop_event.clear()
             self.log(f"Starting Duplex Tunnel as {self.role.get().upper()}...")
             self.toggle_sender()
             self.toggle_receiver()
@@ -95,8 +96,9 @@ class QRTunnelGUI:
                 self.toggle_socks5()
             self.btn_duplex.config(text="🛑 STOP TUNNEL")
         else:
-            self.running = False
+            self.stop_event.set()
             self.socks5_active = False
+            self.log("Stopping all services...")
             self.btn_duplex.config(text="🚀 START AUTOMATIC DUPLEX TUNNEL")
 
     def auto_start_host(self):
@@ -244,13 +246,13 @@ class QRTunnelGUI:
         self.log(f"Capture area updated: {width}x{height} at ({left}, {top})")
 
     def toggle_sender(self):
-        if not self.running:
-            self.running = True
+        if self.lbl_status.cget("text") != "STATUS: SENDER ACTIVE":
+            self.stop_event.clear()
             self.btn_send.config(text="Stop Sender")
             self.lbl_status.config(text="STATUS: SENDER ACTIVE", foreground="green")
             threading.Thread(target=self.run_sender_logic, daemon=True).start()
         else:
-            self.running = False
+            self.stop_event.set()
             self.lbl_status.config(text="STATUS: IDLE", foreground="blue")
             self.btn_send.config(text="Start Sender")
 
@@ -261,11 +263,11 @@ class QRTunnelGUI:
             if self.use_web_capture.get():
                 threading.Thread(target=self.run_web_server, daemon=True).start()
             self.lbl_status.config(text="STATUS: RECEIVER ACTIVE", foreground="green")
+            self.stop_event.clear()
             threading.Thread(target=self.run_receiver_logic, daemon=True).start()
         else:
-            self.running = False
+            self.stop_event.set()
             self.lbl_status.config(text="STATUS: IDLE", foreground="blue")
-            self.btn_recv.config(text="Start Receiver")
 
     def run_web_server(self):
         if self.web_server_started: return
@@ -277,7 +279,7 @@ class QRTunnelGUI:
                 self.send_header('Access-Control-Allow-Origin', '*')
                 self.send_header('Content-Type', 'application/json')
                 self.end_headers()
-                status = "true" if outer_self.running else "false"
+                status = "true" if not outer_self.stop_event.is_set() else "false"
                 self.wfile.write(f'{{"running": {status}}}'.encode())
 
             def do_OPTIONS(self):
@@ -320,12 +322,12 @@ class QRTunnelGUI:
         seq = 0
         self.log(f"Sender active on {ip}:{port}")
         
-        while self.running:
+        while not self.stop_event.is_set():
             try:
                 # Connect to the virtual camera filter with a retry loop
                 with pyvirtualcam.Camera(width=640, height=480, fps=20, device="Unity Video Capture") as cam:
                     self.log("Virtual Camera initialized successfully.")
-                    while self.running:
+                    while not self.stop_event.is_set():
                             packet_datas = []
                             try:
                                 ptype, stream_id, full_data, current_pkt_id = TYPE_DATA, 0, b"", 0
@@ -386,7 +388,7 @@ class QRTunnelGUI:
                                 
                             self.root.after(0, self.update_stats_ui)
             except Exception as e:
-                if not self.running: break
+                if self.stop_event.is_set(): break
                 self.log(f"Sender Hardware Error: {e}. Retrying in 5s...")
                 time.sleep(5)
 
@@ -476,7 +478,7 @@ class QRTunnelGUI:
             self.active_streams[stream_id] = remote_sock
             self.log(f"Host: Connected to {target_str} for Stream {stream_id}")
 
-            while self.running:
+            while not self.stop_event.is_set():
                 data = remote_sock.recv(1024)
                 if not data: break
                 self.outgoing_queue.put((TYPE_DATA, stream_id, data))
@@ -494,13 +496,13 @@ class QRTunnelGUI:
         detector = cv2.QRCodeDetector()
         
         self.log("Receiver started. Waiting for sync...")
-        last_seq = -1
+        self.last_seq = -1
         
-        while self.running:
+        while not self.stop_event.is_set():
             try:
-                frame = None
                 with mss.mss() as sct:
-                    while self.running:
+                    while not self.stop_event.is_set():
+                        frame = None
                         if self.use_web_capture.get():
                             with self.frame_lock:
                                 if self.web_frame is not None:
@@ -518,10 +520,13 @@ class QRTunnelGUI:
                             frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
                         
                         # Detect and decode
+                        # Preprocessing overhaul: Contrast and Blur reduction
                         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                        _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
+                        # Sharpening to combat video conferencing compression
+                        kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
+                        enhanced = cv2.filter2D(gray, -1, kernel)
                         
-                        data, bbox, _ = detector.detectAndDecode(thresh)
+                        data, bbox, _ = detector.detectAndDecode(enhanced)
                         if not data:
                             data, bbox, _ = detector.detectAndDecode(frame)
 
@@ -534,22 +539,22 @@ class QRTunnelGUI:
                                     chunk_data = raw_payload[16:16+plen]
 
                                     if ptype == TYPE_HANDSHAKE:
-                                        if pkt_id > last_seq: last_seq = pkt_id - 1
+                                        if pkt_id > self.last_seq: self.last_seq = pkt_id - 1
                                     
-                                    elif pkt_id <= last_seq and ptype != TYPE_ACK:
+                                    elif pkt_id <= self.last_seq and ptype != TYPE_ACK:
                                         self.outgoing_queue.put((TYPE_ACK, 0, struct.pack("!I", pkt_id)))
                                         continue
 
                                     if ptype == TYPE_TCP_CONNECT and self.role.get() == "host":
                                         self.outgoing_queue.put((TYPE_ACK, 0, struct.pack("!I", pkt_id)))
-                                        last_seq = pkt_id
+                                        self.last_seq = pkt_id
                                         target_str = chunk_data.decode(errors='ignore')
                                         if ":" in target_str:
                                             threading.Thread(target=self.run_host_exit, args=(stream_id, target_str), daemon=True).start()
 
                                     elif ptype == TYPE_TCP_FIN:
                                         self.outgoing_queue.put((TYPE_ACK, 0, struct.pack("!I", pkt_id)))
-                                        last_seq = pkt_id
+                                        self.last_seq = pkt_id
                                         if stream_id in self.active_streams:
                                             self.active_streams[stream_id].close()
                                             del self.active_streams[stream_id]
@@ -559,7 +564,7 @@ class QRTunnelGUI:
                                             if pkt_id in self.unacked_packets: del self.unacked_packets[pkt_id]
 
                                     elif ptype == TYPE_DATA:
-                                        if pkt_id > last_seq:
+                                        if pkt_id > self.last_seq:
                                             if pkt_id not in self.reassembly_buffer:
                                                 self.reassembly_buffer[pkt_id] = {"frags": [None] * f_total, "timestamp": time.time()}
                                             self.reassembly_buffer[pkt_id]["frags"][f_idx] = chunk_data
@@ -572,7 +577,7 @@ class QRTunnelGUI:
                                                     sock.sendto(full_packet, ("127.0.0.1", port))
                                                 
                                                 self.outgoing_queue.put((TYPE_ACK, 0, struct.pack("!I", pkt_id)))
-                                                last_seq = pkt_id
+                                                self.last_seq = pkt_id
                                                 del self.reassembly_buffer[pkt_id]
                                                 self.stats["recv"] += 1
 
@@ -585,7 +590,7 @@ class QRTunnelGUI:
                         self.root.after(0, self.update_stats_ui)
                         time.sleep(0.03)
             except Exception as e:
-                if not self.running: break
+                if self.stop_event.is_set(): break
                 self.log(f"Receiver Error: {e}. Recovering...")
                 time.sleep(2)
 
